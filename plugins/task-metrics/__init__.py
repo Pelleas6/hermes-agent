@@ -84,6 +84,9 @@ def _canonical_task(
             store.ensure_task(mapped, profile=profile, model=str(model) if model else None)
             return mapped
         if task_id:
+            # A raw task identifier should normally be unique.  If it is reused
+            # after a completed turn, create a new generation rather than
+            # rewriting immutable historical timing.
             mapped = None
         else:
             store.unbind_context(key)
@@ -408,6 +411,7 @@ def _on_session_end(
         },
     )
 
+    # Kanban lifecycle hooks are authoritative for board task completion.
     if row.get("source") == "kanban":
         return
 
@@ -576,6 +580,9 @@ def _safe_register_hook(ctx: Any, name: str, callback: Any) -> None:
         ctx.register_hook(name, callback)
         _REGISTERED_HOOKS.append(name)
     except Exception:
+        # Compatibility with Hermes releases that predate one of the optional
+        # lifecycle hooks.  Core timing still loads through the hooks that the
+        # installed runtime supports.
         return
 
 
