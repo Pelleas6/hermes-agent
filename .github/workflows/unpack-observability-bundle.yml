@@ -30,7 +30,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat .build/observability-bundle.b64.part* | base64 --decode > /tmp/observability.tar.gz
+          cat .build/observability-bundle.b64.part* | base64 --ignore-garbage --decode > /tmp/observability.tar.gz
           echo "02effb1d22ab25c1cb7173a4a68834fde12f983ace456799998ac95747300ee5  /tmp/observability.tar.gz" | sha256sum -c -
           tar -tzf /tmp/observability.tar.gz
           tar -xzf /tmp/observability.tar.gz
