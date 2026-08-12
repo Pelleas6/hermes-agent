@@ -1,0 +1,4 @@
+name: task-metrics
+version: 1.0.0
+description: "Automatically measures Hermes task, tool, API, subagent and Kanban timing without storing prompts or results."
+author: "Pelleas6"

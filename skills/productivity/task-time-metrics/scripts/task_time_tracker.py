@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Hermes task timing CLI.
+
+Supports explicit/manual phase timing and the automatic observations written by
+the ``task-metrics`` plugin.  Uses only the Python standard library.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -10,9 +16,9 @@ import statistics
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
-KINDS = (
+SEGMENT_KINDS = (
     "agent_work",
     "review",
     "rework",
@@ -24,29 +30,41 @@ KINDS = (
     "blocked",
 )
 OUTCOMES = ("success", "partial", "failed", "cancelled")
+WAIT_OBSERVATION_KINDS = {
+    "llm_api",
+    "tool",
+    "ci_wait",
+    "deploy_wait",
+    "external_wait",
+    "user_wait",
+    "blocked",
+}
 
 
-def utc_now() -> datetime:
+def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def iso(dt: datetime | None = None) -> str:
-    return (dt or utc_now()).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+def iso(value: Optional[datetime] = None) -> str:
+    return (value or now_utc()).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def parse_iso(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def default_db_path() -> Path:
     explicit = os.environ.get("HERMES_TASK_TIME_DB")
     if explicit:
         return Path(explicit).expanduser()
-    persistent = Path("/opt/data/metrics/task_time.sqlite3")
+    candidate = Path("/opt/data/metrics/task_time.sqlite3")
     try:
-        persistent.parent.mkdir(parents=True, exist_ok=True)
-        if os.access(persistent.parent, os.W_OK):
-            return persistent
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        if os.access(candidate.parent, os.W_OK):
+            return candidate
     except OSError:
         pass
     return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser() / "metrics" / "task_time.sqlite3"
@@ -54,10 +72,14 @@ def default_db_path() -> Path:
 
 def connect(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=30)
+    conn = sqlite3.connect(path, timeout=15)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=15000")
     conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.Error:
+        pass
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS tasks (
@@ -73,7 +95,6 @@ def connect(path: Path) -> sqlite3.Connection:
             outcome TEXT,
             metadata_json TEXT NOT NULL DEFAULT '{}'
         );
-
         CREATE TABLE IF NOT EXISTS segments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
@@ -83,12 +104,6 @@ def connect(path: Path) -> sqlite3.Connection:
             ended_at TEXT,
             metadata_json TEXT NOT NULL DEFAULT '{}'
         );
-
-        CREATE INDEX IF NOT EXISTS idx_segments_task_id ON segments(task_id);
-        CREATE INDEX IF NOT EXISTS idx_tasks_started_at ON tasks(started_at);
-        CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project);
-        CREATE INDEX IF NOT EXISTS idx_tasks_profile ON tasks(profile);
-
         CREATE TABLE IF NOT EXISTS marks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
@@ -96,15 +111,39 @@ def connect(path: Path) -> sqlite3.Connection:
             ts TEXT NOT NULL,
             metadata_json TEXT NOT NULL DEFAULT '{}'
         );
-
+        CREATE TABLE IF NOT EXISTS task_context (
+            context_key TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+            profile TEXT,
+            source TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+            kind TEXT NOT NULL,
+            name TEXT,
+            ts TEXT NOT NULL,
+            duration_ms REAL,
+            status TEXT,
+            profile TEXT,
+            model TEXT,
+            provider TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_segments_task_id ON segments(task_id);
         CREATE INDEX IF NOT EXISTS idx_marks_task_id ON marks(task_id);
+        CREATE INDEX IF NOT EXISTS idx_tasks_started_at ON tasks(started_at);
+        CREATE INDEX IF NOT EXISTS idx_tasks_profile ON tasks(profile);
+        CREATE INDEX IF NOT EXISTS idx_observations_task_ts ON observations(task_id, ts);
         """
     )
     return conn
 
 
-def parse_meta(values: list[str] | None) -> dict[str, str]:
-    result: dict[str, str] = {}
+def parse_meta(values: Optional[Sequence[str]]) -> Dict[str, str]:
+    result: Dict[str, str] = {}
     for item in values or []:
         if "=" not in item:
             raise SystemExit(f"Invalid --meta value {item!r}; expected key=value")
@@ -112,149 +151,115 @@ def parse_meta(values: list[str] | None) -> dict[str, str]:
         key = key.strip()
         if not key:
             raise SystemExit("Metadata key cannot be empty")
-        result[key] = value
+        result[key[:80]] = value[:240]
     return result
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row:
-    row = conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+    row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
     if row is None:
         raise SystemExit(f"Unknown task_id: {task_id}")
     return row
 
 
-def close_open_segment(conn: sqlite3.Connection, task_id: str, ended_at: str) -> None:
+def close_open_segments(conn: sqlite3.Connection, task_id: str, ended_at: str) -> None:
     conn.execute(
-        """
-        UPDATE segments
-        SET ended_at = ?
-        WHERE task_id = ? AND ended_at IS NULL
-        """,
+        "UPDATE segments SET ended_at=? WHERE task_id=? AND ended_at IS NULL",
         (ended_at, task_id),
     )
 
 
-def cmd_start(args: argparse.Namespace) -> None:
-    db = Path(args.db)
-    conn = connect(db)
-    task_id = args.task_id or str(uuid.uuid4())
-    now = iso()
-    meta = parse_meta(args.meta)
-    with conn:
-        existing = conn.execute("SELECT task_id FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
-        if existing:
-            raise SystemExit(f"task_id already exists: {task_id}")
-        conn.execute(
-            """
-            INSERT INTO tasks (
-                task_id, title, project, profile, model, source,
-                started_at, status, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)
-            """,
-            (
-                task_id,
-                args.title,
-                args.project,
-                args.profile,
-                args.model,
-                args.source,
-                now,
-                json.dumps(meta, ensure_ascii=False, sort_keys=True),
-            ),
+def task_observations(conn: sqlite3.Connection, task_id: str) -> List[Dict[str, Any]]:
+    try:
+        return [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM observations WHERE task_id=? ORDER BY id", (task_id,)
+            )
+        ]
+    except sqlite3.Error:
+        return []
+
+
+def task_segments(conn: sqlite3.Connection, task_id: str) -> List[Dict[str, Any]]:
+    return [
+        dict(row)
+        for row in conn.execute(
+            "SELECT * FROM segments WHERE task_id=? ORDER BY id", (task_id,)
         )
-        conn.execute(
-            """
-            INSERT INTO segments (task_id, kind, label, started_at, metadata_json)
-            VALUES (?, ?, ?, ?, '{}')
-            """,
-            (task_id, args.kind, args.label, now),
-        )
-    print(json.dumps({"task_id": task_id, "started_at": now, "db": str(db)}, ensure_ascii=False))
+    ]
 
 
-def cmd_switch(args: argparse.Namespace) -> None:
-    db = Path(args.db)
-    conn = connect(db)
-    task = get_task(conn, args.task_id)
-    if task["status"] != "running":
-        raise SystemExit(f"Task is not running: {args.task_id}")
-    now = iso()
-    meta = parse_meta(args.meta)
-    with conn:
-        close_open_segment(conn, args.task_id, now)
-        conn.execute(
-            """
-            INSERT INTO segments (task_id, kind, label, started_at, metadata_json)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                args.task_id,
-                args.kind,
-                args.label,
-                now,
-                json.dumps(meta, ensure_ascii=False, sort_keys=True),
-            ),
-        )
-    print(json.dumps({"task_id": args.task_id, "kind": args.kind, "started_at": now}, ensure_ascii=False))
+def duration(start: Any, end: Any, now: datetime) -> float:
+    try:
+        start_dt = parse_iso(str(start))
+        end_dt = parse_iso(str(end)) if end else now
+        return max(0.0, (end_dt - start_dt).total_seconds())
+    except Exception:
+        return 0.0
 
 
-def cmd_mark(args: argparse.Namespace) -> None:
-    db = Path(args.db)
-    conn = connect(db)
-    get_task(conn, args.task_id)
-    now = iso()
-    meta = parse_meta(args.meta)
-    with conn:
-        conn.execute(
-            "INSERT INTO marks (task_id, name, ts, metadata_json) VALUES (?, ?, ?, ?)",
-            (args.task_id, args.name, now, json.dumps(meta, ensure_ascii=False, sort_keys=True)),
-        )
-    print(json.dumps({"task_id": args.task_id, "name": args.name, "ts": now}, ensure_ascii=False))
-
-
-def cmd_finish(args: argparse.Namespace) -> None:
-    db = Path(args.db)
-    conn = connect(db)
-    task = get_task(conn, args.task_id)
-    if task["status"] != "running":
-        raise SystemExit(f"Task is already finished: {args.task_id}")
-    now = iso()
-    with conn:
-        close_open_segment(conn, args.task_id, now)
-        conn.execute(
-            """
-            UPDATE tasks
-            SET finished_at = ?, status = 'completed', outcome = ?
-            WHERE task_id = ?
-            """,
-            (now, args.outcome, args.task_id),
-        )
-    summary = summarize_task(conn, args.task_id, now_dt=parse_iso(now))
-    print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
-
-
-def duration_seconds(start: str, end: str | None, now_dt: datetime) -> float:
-    start_dt = parse_iso(start)
-    end_dt = parse_iso(end) if end else now_dt
-    return max(0.0, (end_dt - start_dt).total_seconds())
-
-
-def summarize_task(conn: sqlite3.Connection, task_id: str, now_dt: datetime | None = None) -> dict[str, Any]:
-    now_dt = now_dt or utc_now()
+def summarize_task(conn: sqlite3.Connection, task_id: str, *, now: Optional[datetime] = None) -> Dict[str, Any]:
+    now = now or now_utc()
     task = get_task(conn, task_id)
-    segments = conn.execute(
-        "SELECT kind, label, started_at, ended_at FROM segments WHERE task_id = ? ORDER BY id",
-        (task_id,),
-    ).fetchall()
-    by_kind: dict[str, float] = {kind: 0.0 for kind in KINDS}
-    for seg in segments:
-        by_kind.setdefault(seg["kind"], 0.0)
-        by_kind[seg["kind"]] += duration_seconds(seg["started_at"], seg["ended_at"], now_dt)
+    segments = task_segments(conn, task_id)
+    observations = task_observations(conn, task_id)
+    wall = duration(task["started_at"], task["finished_at"], now)
 
-    wall_end = parse_iso(task["finished_at"]) if task["finished_at"] else now_dt
-    wall = max(0.0, (wall_end - parse_iso(task["started_at"])).total_seconds())
-    active = sum(by_kind.get(k, 0.0) for k in ("agent_work", "review", "rework"))
-    wait = sum(v for k, v in by_kind.items() if k not in ("agent_work", "review", "rework"))
+    by_kind: Dict[str, float] = {}
+    manual_active = 0.0
+    manual_wait = 0.0
+    for segment in segments:
+        seconds = duration(segment.get("started_at"), segment.get("ended_at"), now)
+        kind = str(segment.get("kind") or "agent_work")
+        by_kind[kind] = by_kind.get(kind, 0.0) + seconds
+        if kind in {"agent_work", "review", "rework"}:
+            manual_active += seconds
+        else:
+            manual_wait += seconds
+
+    failures = 0
+    tokens: Dict[str, int] = {}
+    providers: Dict[str, int] = {}
+    tools: Dict[str, int] = {}
+    for observation in observations:
+        kind = str(observation.get("kind") or "event")
+        seconds = max(0.0, float(observation.get("duration_ms") or 0.0)) / 1000.0
+        by_kind[kind] = by_kind.get(kind, 0.0) + seconds
+        if str(observation.get("status") or "").lower() in {"failed", "failure", "error"}:
+            failures += 1
+        if observation.get("provider"):
+            key = str(observation["provider"])
+            providers[key] = providers.get(key, 0) + 1
+        if kind == "tool" and observation.get("name"):
+            key = str(observation["name"])
+            tools[key] = tools.get(key, 0) + 1
+        try:
+            metadata = json.loads(observation.get("metadata_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        if isinstance(metadata, dict):
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "total_tokens",
+            ):
+                value = metadata.get(key)
+                if isinstance(value, (int, float)):
+                    tokens[key] = tokens.get(key, 0) + int(value)
+
+    observed_wait = sum(by_kind.get(kind, 0.0) for kind in WAIT_OBSERVATION_KINDS)
+    if segments:
+        active = manual_active
+        wait = manual_wait
+        timing_mode = "manual_segments"
+    else:
+        wait = min(wall, observed_wait)
+        active = max(0.0, wall - wait)
+        timing_mode = "automatic_observations"
+
     return {
         "task_id": task["task_id"],
         "title": task["title"],
@@ -270,131 +275,313 @@ def summarize_task(conn: sqlite3.Connection, task_id: str, now_dt: datetime | No
         "active_seconds": round(active, 3),
         "wait_seconds": round(wait, 3),
         "efficiency_ratio": round(active / wall, 4) if wall > 0 else None,
-        "by_kind_seconds": {k: round(v, 3) for k, v in by_kind.items() if v > 0},
+        "timing_mode": timing_mode,
+        "segment_count": len(segments),
+        "observation_count": len(observations),
+        "failure_observation_count": failures,
+        "by_kind_seconds": {key: round(value, 3) for key, value in sorted(by_kind.items()) if value > 0},
+        "tokens": tokens,
+        "providers": providers,
+        "tools": tools,
     }
 
 
-def parse_since(value: str | None) -> datetime | None:
+def cmd_start(args: argparse.Namespace) -> None:
+    path = Path(args.db)
+    conn = connect(path)
+    task_id = args.task_id or str(uuid.uuid4())
+    started = iso()
+    metadata = parse_meta(args.meta)
+    try:
+        with conn:
+            if conn.execute("SELECT 1 FROM tasks WHERE task_id=?", (task_id,)).fetchone():
+                raise SystemExit(f"task_id already exists: {task_id}")
+            conn.execute(
+                """INSERT INTO tasks(
+                       task_id,title,project,profile,model,source,started_at,status,metadata_json
+                   ) VALUES(?,?,?,?,?,?,?,'running',?)""",
+                (
+                    task_id,
+                    args.title,
+                    args.project,
+                    args.profile,
+                    args.model,
+                    args.source,
+                    started,
+                    json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                ),
+            )
+            conn.execute(
+                """INSERT INTO segments(task_id,kind,label,started_at,metadata_json)
+                   VALUES(?,?,?,?,?)""",
+                (task_id, args.kind, args.label, started, "{}"),
+            )
+    finally:
+        conn.close()
+    print(json.dumps({"task_id": task_id, "started_at": started, "db": str(path)}, ensure_ascii=False))
+
+
+def cmd_switch(args: argparse.Namespace) -> None:
+    conn = connect(Path(args.db))
+    changed = iso()
+    try:
+        task = get_task(conn, args.task_id)
+        if task["status"] != "running":
+            raise SystemExit(f"Task is not running: {args.task_id}")
+        with conn:
+            close_open_segments(conn, args.task_id, changed)
+            conn.execute(
+                """INSERT INTO segments(task_id,kind,label,started_at,metadata_json)
+                   VALUES(?,?,?,?,?)""",
+                (
+                    args.task_id,
+                    args.kind,
+                    args.label,
+                    changed,
+                    json.dumps(parse_meta(args.meta), ensure_ascii=False, sort_keys=True),
+                ),
+            )
+    finally:
+        conn.close()
+    print(json.dumps({"task_id": args.task_id, "kind": args.kind, "started_at": changed}, ensure_ascii=False))
+
+
+def cmd_mark(args: argparse.Namespace) -> None:
+    conn = connect(Path(args.db))
+    timestamp = iso()
+    try:
+        get_task(conn, args.task_id)
+        with conn:
+            conn.execute(
+                "INSERT INTO marks(task_id,name,ts,metadata_json) VALUES(?,?,?,?)",
+                (
+                    args.task_id,
+                    args.name,
+                    timestamp,
+                    json.dumps(parse_meta(args.meta), ensure_ascii=False, sort_keys=True),
+                ),
+            )
+    finally:
+        conn.close()
+    print(json.dumps({"task_id": args.task_id, "name": args.name, "ts": timestamp}, ensure_ascii=False))
+
+
+def cmd_finish(args: argparse.Namespace) -> None:
+    conn = connect(Path(args.db))
+    finished = iso()
+    try:
+        task = get_task(conn, args.task_id)
+        if task["status"] != "running":
+            raise SystemExit(f"Task is already finished: {args.task_id}")
+        with conn:
+            close_open_segments(conn, args.task_id, finished)
+            conn.execute(
+                """UPDATE tasks SET finished_at=?,status='completed',outcome=?
+                   WHERE task_id=? AND status='running'""",
+                (finished, args.outcome, args.task_id),
+            )
+        summary = summarize_task(conn, args.task_id, now=parse_iso(finished))
+    finally:
+        conn.close()
+    print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+
+
+def parse_since(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
-    value = value.strip().lower()
-    if value.endswith("d") and value[:-1].isdigit():
-        return utc_now() - timedelta(days=int(value[:-1]))
-    if value.endswith("h") and value[:-1].isdigit():
-        return utc_now() - timedelta(hours=int(value[:-1]))
+    text = str(value).strip().lower()
+    if len(text) >= 2 and text[-1] in {"h", "d", "w"}:
+        units = {"h": 3600, "d": 86400, "w": 604800}
+        try:
+            return now_utc() - timedelta(seconds=float(text[:-1]) * units[text[-1]])
+        except ValueError:
+            pass
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise SystemExit("--since must be ISO-8601 or like 24h / 7d / 30d") from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        return parse_iso(text)
+    except Exception as exc:
+        raise SystemExit("--since must be ISO-8601 or like 24h / 7d / 4w") from exc
 
 
-def matching_tasks(conn: sqlite3.Connection, args: argparse.Namespace) -> list[sqlite3.Row]:
-    clauses: list[str] = []
-    params: list[Any] = []
-    since = parse_since(args.since)
+def matching_tasks(conn: sqlite3.Connection, args: argparse.Namespace) -> List[sqlite3.Row]:
+    clauses: List[str] = []
+    params: List[Any] = []
+    since = parse_since(getattr(args, "since", None))
     if since:
-        clauses.append("started_at >= ?")
+        clauses.append("started_at>=?")
         params.append(iso(since))
-    for field in ("project", "profile", "model", "outcome"):
+    for field in ("project", "profile", "model", "source", "outcome"):
         value = getattr(args, field, None)
         if value:
-            clauses.append(f"{field} = ?")
+            clauses.append(f"{field}=?")
             params.append(value)
     query = "SELECT * FROM tasks"
     if clauses:
         query += " WHERE " + " AND ".join(clauses)
     query += " ORDER BY started_at"
-    return conn.execute(query, params).fetchall()
+    return list(conn.execute(query, params))
 
 
-def percentile(values: list[float], p: float) -> float | None:
+def aggregate(summaries: Sequence[Mapping[str, Any]], include_tasks: bool) -> Dict[str, Any]:
+    completed = [item for item in summaries if item.get("status") == "completed"]
+    success = [item for item in completed if item.get("outcome") == "success"]
+    walls = [float(item.get("wall_seconds") or 0.0) for item in completed]
+    actives = [float(item.get("active_seconds") or 0.0) for item in completed]
+    waits = [float(item.get("wait_seconds") or 0.0) for item in completed]
+    by_kind: Dict[str, float] = {}
+    outcomes: Dict[str, int] = {}
+    profiles: Dict[str, int] = {}
+    models: Dict[str, int] = {}
+    sources: Dict[str, int] = {}
+    tokens: Dict[str, int] = {}
+    for item in summaries:
+        outcome = str(item.get("outcome") or item.get("status") or "unknown")
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        for field, target in (("profile", profiles), ("model", models), ("source", sources)):
+            value = item.get(field)
+            if value:
+                target[str(value)] = target.get(str(value), 0) + 1
+        for key, value in (item.get("by_kind_seconds") or {}).items():
+            by_kind[str(key)] = by_kind.get(str(key), 0.0) + float(value)
+        for key, value in (item.get("tokens") or {}).items():
+            tokens[str(key)] = tokens.get(str(key), 0) + int(value)
+    total_wall = sum(walls)
+    total_active = sum(actives)
+    rework = by_kind.get("rework", 0.0)
+    return {
+        "task_count": len(summaries),
+        "completed_count": len(completed),
+        "running_count": len(summaries) - len(completed),
+        "success_rate": round(len(success) / len(completed), 4) if completed else None,
+        "total_wall_seconds": round(total_wall, 3),
+        "total_active_seconds": round(total_active, 3),
+        "total_wait_seconds": round(sum(waits), 3),
+        "overall_efficiency_ratio": round(total_active / total_wall, 4) if total_wall > 0 else None,
+        "rework_share": round(rework / total_active, 4) if total_active > 0 else None,
+        "median_wall_seconds": round(statistics.median(walls), 3) if walls else None,
+        "p90_wall_seconds": round(percentile(walls, 0.9) or 0.0, 3) if walls else None,
+        "median_active_seconds": round(statistics.median(actives), 3) if actives else None,
+        "outcomes": outcomes,
+        "profiles": profiles,
+        "models": models,
+        "sources": sources,
+        "tokens": tokens,
+        "by_kind_seconds": {key: round(value, 3) for key, value in sorted(by_kind.items())},
+        "tasks": list(summaries) if include_tasks else None,
+    }
+
+
+def percentile(values: Sequence[float], fraction: float) -> Optional[float]:
     if not values:
         return None
     ordered = sorted(values)
     if len(ordered) == 1:
         return ordered[0]
-    idx = (len(ordered) - 1) * p
-    lo = int(idx)
-    hi = min(lo + 1, len(ordered) - 1)
-    frac = idx - lo
-    return ordered[lo] * (1 - frac) + ordered[hi] * frac
+    index = (len(ordered) - 1) * fraction
+    low = int(index)
+    high = min(low + 1, len(ordered) - 1)
+    part = index - low
+    return ordered[low] * (1 - part) + ordered[high] * part
 
 
 def cmd_report(args: argparse.Namespace) -> None:
-    db = Path(args.db)
-    conn = connect(db)
-    rows = matching_tasks(conn, args)
-    summaries = [summarize_task(conn, row["task_id"]) for row in rows]
-    walls = [s["wall_seconds"] for s in summaries]
-    actives = [s["active_seconds"] for s in summaries]
-    kinds: dict[str, float] = {}
-    outcomes: dict[str, int] = {}
-    for summary in summaries:
-        outcome_key = summary["outcome"] or summary["status"]
-        outcomes[outcome_key] = outcomes.get(outcome_key, 0) + 1
-        for kind, seconds in summary["by_kind_seconds"].items():
-            kinds[kind] = kinds.get(kind, 0.0) + seconds
-    completed = [s for s in summaries if s["status"] == "completed"]
-    success = [s for s in completed if s["outcome"] == "success"]
-    report = {
-        "task_count": len(summaries),
-        "completed_count": len(completed),
-        "success_rate": round(len(success) / len(completed), 4) if completed else None,
-        "total_wall_seconds": round(sum(walls), 3),
-        "total_active_seconds": round(sum(actives), 3),
-        "overall_efficiency_ratio": round(sum(actives) / sum(walls), 4) if sum(walls) > 0 else None,
-        "median_wall_seconds": round(statistics.median(walls), 3) if walls else None,
-        "p90_wall_seconds": round(percentile(walls, 0.9), 3) if walls else None,
-        "median_active_seconds": round(statistics.median(actives), 3) if actives else None,
-        "by_kind_seconds": {k: round(v, 3) for k, v in sorted(kinds.items())},
-        "outcomes": outcomes,
-        "tasks": summaries if args.include_tasks else None,
-    }
+    conn = connect(Path(args.db))
+    try:
+        rows = matching_tasks(conn, args)
+        summaries = [summarize_task(conn, str(row["task_id"])) for row in rows]
+        report = aggregate(summaries, args.include_tasks)
+    finally:
+        conn.close()
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def cmd_show(args: argparse.Namespace) -> None:
-    db = Path(args.db)
-    conn = connect(db)
-    summary = summarize_task(conn, args.task_id)
-    marks = conn.execute(
-        "SELECT name, ts, metadata_json FROM marks WHERE task_id = ? ORDER BY id",
-        (args.task_id,),
-    ).fetchall()
-    summary["marks"] = [
-        {"name": row["name"], "ts": row["ts"], "metadata": json.loads(row["metadata_json"] or "{}")}
-        for row in marks
-    ]
+    conn = connect(Path(args.db))
+    try:
+        summary = summarize_task(conn, args.task_id)
+        marks = [
+            {
+                "name": row["name"],
+                "ts": row["ts"],
+                "metadata": json.loads(row["metadata_json"] or "{}"),
+            }
+            for row in conn.execute(
+                "SELECT name,ts,metadata_json FROM marks WHERE task_id=? ORDER BY id",
+                (args.task_id,),
+            )
+        ]
+        summary["marks"] = marks
+    finally:
+        conn.close()
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def cmd_export(args: argparse.Namespace) -> None:
-    db = Path(args.db)
-    conn = connect(db)
-    rows = matching_tasks(conn, args)
-    summaries = [summarize_task(conn, row["task_id"]) for row in rows]
+    conn = connect(Path(args.db))
+    try:
+        rows = matching_tasks(conn, args)
+        summaries = [summarize_task(conn, str(row["task_id"])) for row in rows]
+    finally:
+        conn.close()
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     if args.format == "json":
         output.write_text(json.dumps(summaries, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     else:
-        fieldnames = [
+        fields = [
             "task_id", "title", "project", "profile", "model", "source", "status", "outcome",
-            "started_at", "finished_at", "wall_seconds", "active_seconds", "wait_seconds", "efficiency_ratio",
-            *[f"{kind}_seconds" for kind in KINDS],
+            "started_at", "finished_at", "wall_seconds", "active_seconds", "wait_seconds",
+            "efficiency_ratio", "timing_mode", "observation_count", "failure_observation_count",
         ]
         with output.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
             for summary in summaries:
-                flat = {key: summary.get(key) for key in fieldnames}
-                for kind in KINDS:
-                    flat[f"{kind}_seconds"] = summary["by_kind_seconds"].get(kind, 0.0)
-                writer.writerow(flat)
+                writer.writerow({key: summary.get(key) for key in fields})
     print(json.dumps({"exported": len(summaries), "output": str(output), "format": args.format}))
+
+
+def cmd_doctor(args: argparse.Namespace) -> None:
+    path = Path(args.db)
+    conn = connect(path)
+    try:
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()
+        counts = {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("tasks", "segments", "marks", "observations", "task_context")
+        }
+        stale = []
+        cutoff = now_utc() - timedelta(hours=float(args.stale_after_hours))
+        for row in conn.execute("SELECT task_id,profile,started_at FROM tasks WHERE status='running'"):
+            try:
+                if parse_iso(row["started_at"]) < cutoff:
+                    stale.append({
+                        "task_id": row["task_id"],
+                        "profile": row["profile"],
+                        "started_at": row["started_at"],
+                    })
+            except Exception:
+                continue
+    finally:
+        conn.close()
+    result = {
+        "db": str(path),
+        "integrity": integrity[0] if integrity else None,
+        "counts": counts,
+        "stale_running": stale,
+        "ok": bool(integrity and str(integrity[0]).lower() == "ok"),
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    if not result["ok"]:
+        raise SystemExit(1)
+
+
+def add_filters(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--since")
+    parser.add_argument("--project")
+    parser.add_argument("--profile")
+    parser.add_argument("--model")
+    parser.add_argument("--source")
+    parser.add_argument("--outcome", choices=OUTCOMES)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -402,21 +589,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", default=str(default_db_path()), help="SQLite database path")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    start = sub.add_parser("start", help="Start a task and its first timing segment")
+    start = sub.add_parser("start", help="Start a task and its first manual phase")
     start.add_argument("--task-id")
     start.add_argument("--title", required=True)
     start.add_argument("--project")
     start.add_argument("--profile")
     start.add_argument("--model")
     start.add_argument("--source", default="hermes")
-    start.add_argument("--kind", choices=KINDS, default="agent_work")
+    start.add_argument("--kind", choices=SEGMENT_KINDS, default="agent_work")
     start.add_argument("--label")
     start.add_argument("--meta", action="append")
     start.set_defaults(func=cmd_start)
 
-    switch = sub.add_parser("switch", help="Close current segment and switch timing kind")
+    switch = sub.add_parser("switch", help="Close current phase and switch timing kind")
     switch.add_argument("task_id")
-    switch.add_argument("--kind", choices=KINDS, required=True)
+    switch.add_argument("--kind", choices=SEGMENT_KINDS, required=True)
     switch.add_argument("--label")
     switch.add_argument("--meta", action="append")
     switch.set_defaults(func=cmd_switch)
@@ -436,13 +623,6 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("task_id")
     show.set_defaults(func=cmd_show)
 
-    def add_filters(command: argparse.ArgumentParser) -> None:
-        command.add_argument("--since")
-        command.add_argument("--project")
-        command.add_argument("--profile")
-        command.add_argument("--model")
-        command.add_argument("--outcome", choices=OUTCOMES)
-
     report = sub.add_parser("report", help="Aggregate timing metrics")
     add_filters(report)
     report.add_argument("--include-tasks", action="store_true")
@@ -454,12 +634,14 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--output", required=True)
     export.set_defaults(func=cmd_export)
 
+    doctor = sub.add_parser("doctor", help="Check database integrity and stale tasks")
+    doctor.add_argument("--stale-after-hours", type=float, default=24.0)
+    doctor.set_defaults(func=cmd_doctor)
     return parser
 
 
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
     args.func(args)
     return 0
 

@@ -1,0 +1,65 @@
+name: Hermes ops observability quality
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - plugins/task-metrics/**
+      - ops/observability/**
+      - skills/productivity/task-time-metrics/**
+      - tests/test_task_metrics_plugin.py
+      - tests/test_task_time_tracker.py
+      - tests/test_ops_observability.py
+      - .github/workflows/ops-observability.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - plugins/task-metrics/**
+      - ops/observability/**
+      - skills/productivity/task-time-metrics/**
+      - tests/test_task_metrics_plugin.py
+      - tests/test_task_time_tracker.py
+      - tests/test_ops_observability.py
+      - .github/workflows/ops-observability.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ops-observability-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Compile Python sources
+        run: |
+          python -m compileall -q \
+            plugins/task-metrics \
+            skills/productivity/task-time-metrics/scripts \
+            ops/observability
+
+      - name: Validate installer shell
+        run: bash -n ops/observability/install_vps.sh
+
+      - name: Run focused tests
+        run: |
+          python -m unittest discover -s tests -p 'test_task_metrics_plugin.py' -v
+          python -m unittest discover -s tests -p 'test_task_time_tracker.py' -v
+          python -m unittest discover -s tests -p 'test_ops_observability.py' -v
+
+      - name: Check prohibited secret patterns in new runtime files
+        run: |
+          ! grep -RInE '(sk-proj-|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|SUPABASE_SERVICE_ROLE_KEY=|STRIPE_SECRET_KEY=)' \
+            plugins/task-metrics ops/observability skills/productivity/task-time-metrics
