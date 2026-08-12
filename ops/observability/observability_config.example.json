@@ -1,0 +1,40 @@
+{
+  "github_repositories": [
+    "Pelleas6/palm-mvp",
+    "Pelleas6/ArrivalAlert-Android",
+    "Pelleas6/site_IA_Pour_Nul",
+    "Pelleas6/hermes-agent"
+  ],
+  "vercel_projects": [
+    {
+      "name": "palm-mvp"
+    },
+    {
+      "name": "site-ia-pour-nul"
+    }
+  ],
+  "supabase_projects": [],
+  "thresholds": {
+    "disk_warning_pct": 80,
+    "disk_critical_pct": 90,
+    "memory_warning_pct": 85,
+    "memory_critical_pct": 92,
+    "task_success_warning": 0.85,
+    "task_success_critical": 0.7,
+    "first_pass_success_warning": 0.7,
+    "first_pass_success_critical": 0.5,
+    "task_min_sample": 5,
+    "rework_share_warning": 0.3,
+    "stale_task_warning_hours": 6,
+    "stale_task_critical_hours": 24,
+    "cron_heartbeat_warning_seconds": 180,
+    "cron_heartbeat_critical_seconds": 600,
+    "cron_running_stale_hours": 2,
+    "kanban_blocked_warning": 1,
+    "kanban_blocked_critical": 8,
+    "supabase_latency_warning_ms": 1500,
+    "supabase_latency_critical_ms": 5000,
+    "backup_warning_hours": 36,
+    "backup_critical_hours": 72
+  }
+}

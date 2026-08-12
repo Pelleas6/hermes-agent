@@ -1,6 +1,6 @@
 """Automatic task timing and delivery-efficiency metrics for Hermes.
 
-The plugin observes existing Hermes lifecycle hooks. It never blocks the agent
+The plugin observes existing Hermes lifecycle hooks.  It never blocks the agent
 pipeline and never stores prompts, responses, tool arguments, tool results, raw
 errors, phone numbers, or credentials.
 """
@@ -247,8 +247,11 @@ def _on_api_request_error(
 
 def _on_post_tool_call(
     tool_name: str = "",
+    function_name: str = "",
     result: Any = None,
     duration_ms: Any = None,
+    status: Any = None,
+    error_type: Any = None,
     task_id: str = "",
     session_id: str = "",
     model: str = "",
@@ -261,14 +264,19 @@ def _on_post_tool_call(
         model=model,
         platform=platform,
     )
+    explicit_status = str(status or "").strip().lower()
+    safe_status = explicit_status if explicit_status else _status_from_result(result)
     _store().record_observation(
         canonical,
         kind="tool",
-        name=str(tool_name or "unknown")[:160],
+        name=str(tool_name or function_name or "unknown")[:160],
         duration_ms=duration_ms,
-        status=_status_from_result(result),
+        status=safe_status,
         model=str(model)[:160] if model else None,
-        metadata={"platform": str(platform)[:80] if platform else None},
+        metadata={
+            "platform": str(platform)[:80] if platform else None,
+            "error_class": str(error_type or "")[:80] or None,
+        },
     )
 
 
@@ -424,7 +432,10 @@ def _on_kanban_claimed(
     run_id: Any = None,
     **_: Any,
 ) -> None:
-    profile = _profile(profile_name or assignee)
+    # Claim hooks fire in the dispatcher process, so profile_name can be the
+    # dispatcher profile. The assignee is the worker profile that will emit the
+    # completion/block/tool hooks; prefer it to keep one shared task context.
+    profile = _profile(assignee or profile_name)
     base = f"kanban:{stable_hash(board)}:{stable_hash(task_id)}"
     canonical = f"{base}:{stable_hash(run_id)}" if run_id else base
     store = _store()

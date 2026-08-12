@@ -263,7 +263,8 @@ class TaskMetricsStore:
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> str:
         now = started_at or utc_now_iso()
-        profile = profile or active_profile_name()
+        explicit_profile = profile
+        insert_profile = profile or active_profile_name()
         with self.transaction() as conn:
             row = conn.execute(
                 "SELECT status, metadata_json FROM tasks WHERE task_id=?", (task_id,)
@@ -278,7 +279,7 @@ class TaskMetricsStore:
                         task_id,
                         str(title or "Hermes task")[:160],
                         str(project)[:160] if project else None,
-                        profile,
+                        insert_profile,
                         str(model)[:160] if model else None,
                         str(source or "hermes")[:80],
                         now,
@@ -294,7 +295,7 @@ class TaskMetricsStore:
                            model=COALESCE(?, model),
                            metadata_json=?
                        WHERE task_id=?""",
-                    (project, profile, model, merged, task_id),
+                    (project, explicit_profile, model, merged, task_id),
                 )
         return task_id
 
@@ -386,7 +387,7 @@ class TaskMetricsStore:
                        model=COALESCE(?, model),
                        profile=COALESCE(?, profile)
                    WHERE task_id=?""",
-                (model, profile or active_profile_name(), task_id),
+                (model, profile, task_id),
             )
 
     def mark(
@@ -466,7 +467,7 @@ class TaskMetricsStore:
                 "estimated_active_seconds": round(max(0.0, wall - observed_wait), 3),
                 "observation_count": len(observations),
                 "failure_observation_count": failures,
-                "by_kind_seconds": {k: round(v, 3) for k, v in by_kind.items() if v > 0},
+                "by_kind_seconds": {k: round(v, 3) for k, v in sorted(by_kind.items())},
             }
         finally:
             conn.close()

@@ -1,0 +1,61 @@
+name: Unpack industrial observability bundle
+
+on:
+  push:
+    branches: [feature/industrial-observability]
+    paths:
+      - .build/observability-bundle.b64.part*
+      - .github/workflows/unpack-observability-bundle.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unpack-industrial-observability
+  cancel-in-progress: false
+
+jobs:
+  unpack:
+    if: ${{ !contains(github.event.head_commit.message, '[bundle-unpacked]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout staging branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: feature/industrial-observability
+
+      - name: Rebuild and verify bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .build/observability-bundle.b64.part* | base64 --decode > /tmp/observability.tar.gz
+          echo "02effb1d22ab25c1cb7173a4a68834fde12f983ace456799998ac95747300ee5  /tmp/observability.tar.gz" | sha256sum -c -
+          tar -tzf /tmp/observability.tar.gz
+          tar -xzf /tmp/observability.tar.gz
+          rm -rf .build
+          rm -f .github/workflows/unpack-observability-bundle.yml
+
+      - name: Verify source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m compileall -q \
+            plugins/task-metrics \
+            skills/productivity/task-time-metrics/scripts \
+            ops/observability
+          bash -n ops/observability/install_vps.sh
+          python -m unittest discover -s tests -p 'test_task_metrics_plugin.py' -v
+          python -m unittest discover -s tests -p 'test_task_time_tracker.py' -v
+          python -m unittest discover -s tests -p 'test_ops_observability.py' -v
+
+      - name: Commit unpacked source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: unpack industrial observability source [bundle-unpacked]"
+          git push origin HEAD:feature/industrial-observability
